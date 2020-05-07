@@ -8,12 +8,14 @@ gunslinger = {
 }
 
 local config = {
+	debug    = true,
 	max_wear = 65534,
-	projectile_speed = 500,
 	base_dmg = 1,
+	projectile_speed = 500,
 	base_spread = 0.001,
 	base_recoil = 0.001,
-	lite = minetest.settings:get_bool("gunslinger.lite")
+	lite = minetest.settings:get_bool("gunslinger.lite"),
+	fov_transition_time = 0.1
 }
 
 --
@@ -26,7 +28,7 @@ local function rangelim(low, val, high, default)
 	elseif low and val and high then
 		return math.max(low, math.min(val, high))
 	else
-		error("gunslinger: Invalid rangelim invokation!", 2)
+		error("gunslinger: Invalid rangelim invocation!", 2)
 	end
 end
 
@@ -40,13 +42,13 @@ local function get_eye_pos(player)
 	return pos
 end
 
-local function get_pointed_thing(pos, dir, def)
-	if not pos or not dir or not def then
+local function get_pointed_thing(pos, dir, range)
+	if not pos or not dir or not range then
 		error("gunslinger: Invalid get_pointed_thing invocation" ..
 				" (missing params)", 2)
 	end
 
-	local pos2 = vector.add(pos, vector.multiply(dir, def.range))
+	local pos2 = vector.add(pos, vector.multiply(dir, range))
 	local ray = minetest.raycast(pos, pos2)
 	return ray:next()
 end
@@ -65,14 +67,14 @@ local function add_auto(name, def, stack)
 	}
 end
 
-local function validate_def(def)
+local function sanitize_def(def)
 	if type(def) ~= "table" then
-		error("gunslinger.register_gun: Gun definition has to be a table!", 2)
+		error("gunslinger: Gun definition has to be a table!", 2)
 	end
 
 	if (def.mode == "automatic" or def.mode == "hybrid") and config.lite then
-		error("gunslinger.register_gun: Attempting to register gun of " ..
-				"type '" .. def.mode .. "' when lite mode is enabled", 2)
+		error("gunslinger: Attempting to register gun of type '" ..
+			def.mode .. "' when lite mode is enabled", 2)
 	end
 
 	if not def.ammo then
@@ -83,18 +85,24 @@ local function validate_def(def)
 		def.burst = rangelim(2, def.burst, 5, 3)
 	end
 
-	def.dmg_mult = rangelim(1, def.dmg_mult, 100, 1)
+	def.dmg_mult    = rangelim(1, def.dmg_mult, 100, 1)
 	def.reload_time = rangelim(1, def.reload_time, 10, 2.5)
 	def.spread_mult = rangelim(0, def.spread_mult, 500, 0)
 	def.recoil_mult = rangelim(0, def.recoil_mult, 500, 0)
-	def.pellets = rangelim(1, def.pellets, 20, 1)
+	def.pellets     = rangelim(1, def.pellets, 20, 1)
 
-	-- Initialize sounds
-	do
-		def.sounds = def.sounds or {}
-		def.sounds.fire = def.sounds.fire or "gunslinger_fire"
-		def.sounds.reload = def.sounds.reload or "gunslinger_reload"
-		def.sounds.ooa = def.sounds.ooa or "gunslinger_ooa"
+	def.sounds        = def.sounds or {}
+	def.sounds.fire   = def.sounds.fire or "gunslinger_fire"
+	def.sounds.reload = def.sounds.reload or "gunslinger_reload"
+	def.sounds.ooa    = def.sounds.ooa or "gunslinger_ooa"
+
+	-- Limit zoom to 8x; default to no zoom
+	def.zoom = def.zoom and rangelim(1, def.zoom, 8)
+
+	local scale = def.scope_scale
+	if def.scope and (not scale or type(scale) ~= "table" or not scale.x or not scale.y or
+			type(scale.x) ~= "number" or type(scale.y) ~= "number") then
+		error("gunslinger: Invalid `scope_scale` definition!", 2)
 	end
 
 	return def
@@ -102,18 +110,33 @@ end
 
 --------------------------------
 
-local function show_scope(player, scope, zoom)
+local function show_scope(player, zoom, scope, scale)
 	if not player then
 		return
 	end
 
-	-- Create HUD overlay element
-	gunslinger.__scopes[player:get_player_name()] = player:hud_add({
-		hud_elem_type = "image",
-		position = {x = 0.5, y = 0.5},
-		alignment = {x = 0, y = 0},
-		text = scope
-	})
+	local scope_spec = { fov = zoom }
+
+	-- Set FOV multiplier to 1 / def.zoom
+	-- e.g. if def.zoom == 4, FOV multiplier would be 1/4
+	player:set_fov(1 / zoom, true, config.fov_transition_time)
+
+	-- Scope HUD element; disable wielditem and crosshair HUD elements if scope exists
+	if scope then
+		scope_spec.hud = player:hud_add({
+			hud_elem_type = "image",
+			position = {x = 0.5, y = 0.5},
+			alignment = {x = 0, y = 0},
+			scale = scale,
+			text = scope
+		})
+		player:hud_set_flags({
+			wielditem = false,
+			crosshair = false
+		})
+	end
+
+	gunslinger.__scopes[player:get_player_name()] = scope_spec
 end
 
 local function hide_scope(player)
@@ -122,7 +145,19 @@ local function hide_scope(player)
 	end
 
 	local name = player:get_player_name()
-	player:hud_remove(gunslinger.__scopes[name])
+	local scope_spec = gunslinger.__scopes[name]
+
+	player:set_fov(0, false, config.fov_transition_time)
+
+	-- Remove scope HUD element; revert visibility changes to default HUD elements
+	if scope_spec.hud then
+		player:hud_remove(scope_spec.hud)
+		player:hud_set_flags({
+			wielditem = true,
+			crosshair = true
+		})
+	end
+
 	gunslinger.__scopes[name] = nil
 end
 
@@ -148,11 +183,11 @@ local function reload(stack, player)
 		meta:set_string("reloading")
 		local wear = math.floor(config.max_wear -
 				(taken:get_count() / def.clip_size) * config.max_wear)
-		minetest.after(def.reload_time, function(obj, rstack, twear, s_meta)
-			rstack:set_wear(twear)
-			s_meta:set_string("reloading", "")
-			player:set_wielded_item(rstack)
-		end, player, stack, wear, meta)
+		minetest.after(def.reload_time, function()
+			stack:set_wear(wear)
+			meta:set_string("reloading", "")
+			player:set_wielded_item(stack)
+		end)
 	end
 
 	return stack
@@ -203,10 +238,15 @@ local function fire(stack, player)
 	local random = PcgRandom(os.time())
 
 	for i = 1, def.pellets do
-		-- Mimic inaccuracy by applying randomised miniscule deviations
+		-- Mimic inaccuracy by applying randomized miniscule deviations
+		-- Reduce inaccuracy by half if player is using scope
 		if def.spread_mult ~= 0 then
+			-- TODO: Unhardcode scoping factor by taking scope FOVs into consideration
+			local scoping_factor = gunslinger.__scopes[player:get_player_name()] and 0.5 or 1
 			dir = vector.apply(dir, function(n)
-				return n + random:next(-def.spread_mult, def.spread_mult) * config.base_spread
+				return n +
+					random:next(-def.spread_mult, def.spread_mult) *
+					config.base_spread * scoping_factor
 			end)
 		end
 
@@ -215,19 +255,7 @@ local function fire(stack, player)
 			if pointed and pointed.type == "object" then
 				local target = pointed.ref
 				if target:get_player_name() ~= obj:get_player_name() then
-					local point = pointed.intersection_point
 					local dmg = config.base_dmg * gun_def.dmg_mult
-
-					-- Add 50% damage if headshot
-					if point.y > target:get_pos().y + 1.2 then
-						dmg = dmg * 1.5
-					end
-
-					-- Add 20% more damage if player using scope
-					if gunslinger.__scopes[obj:get_player_name()] then
-						dmg = dmg * 1.2
-					end
-
 					target:punch(obj, nil, {damage_groups = {fleshy = dmg}})
 				end
 			end
@@ -332,15 +360,16 @@ local function on_rclick(stack, player)
 	if gunslinger.__scopes[player:get_player_name()] then
 		hide_scope(player)
 	else
-		if def.scope then
-			show_scope(player, def.scope, def.gunslinger.__scopes)
+		if def.zoom then
+			show_scope(player, def.zoom, def.scope, def.scope_scale)
 		end
 	end
 end
 
 --------------------------------
 
-minetest.register_globalstep(function(dtime)
+-- Process automatic fire
+local function auto_fire(dtime)
 	for name in pairs(gunslinger.__interval) do
 		gunslinger.__interval[name] = gunslinger.__interval[name] + dtime
 	end
@@ -366,7 +395,9 @@ minetest.register_globalstep(function(dtime)
 			end
 		end
 	end
-end)
+end
+
+minetest.register_globalstep(auto_fire)
 
 --
 -- External API functions
@@ -378,18 +409,18 @@ end
 
 function gunslinger.register_type(name, def)
 	assert(type(name) == "string" and type(def) == "table",
-	      "gunslinger.register_type: Invalid params!")
+		"gunslinger.register_type: Invalid params!")
 	assert(not gunslinger.__types[name], "gunslinger.register_type:" ..
-	      " Attempt to register a type with an existing name!")
+		" Attempt to register a type with an existing name!")
 
 	gunslinger.__types[name] = def
 end
 
 function gunslinger.register_gun(name, def)
 	assert(type(name) == "string" and type(def) == "table",
-	      "gunslinger.register_gun: Invalid params!")
+		"gunslinger.register_gun: Invalid params!")
 	assert(not gunslinger.__guns[name], "gunslinger.register_gun: " ..
-	      "Attempt to register a gun with an existing name!")
+		"Attempt to register a gun with an existing name!")
 
 	-- Import type defaults if def.type specified
 	if def.type then
@@ -400,7 +431,7 @@ function gunslinger.register_gun(name, def)
 		end
 	end
 
-	def = validate_def(def)
+	def = sanitize_def(def)
 
 	-- Add additional helper fields for internal use
 	def.unit_wear = math.ceil(config.max_wear / def.clip_size)
